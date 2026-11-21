@@ -3,6 +3,8 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
+const { URL } = require('url');
 const WebSocket = require('ws');
 
 const PORT = process.env.PORT || 7777;
@@ -21,6 +23,10 @@ let history = [];               // room messages
 let dms = {};                   // "idA|idB" (sorted) -> [messages]
 let dmq = {};                   // id -> undelivered DM messages
 let seq = 0;
+let emails = {};                // id -> gmail address (for login notifications)
+let ips = {};                   // id -> recently seen IP addresses
+const lastMail = new Map();     // id -> time of the last notification e-mail
+const mailRx = /^[A-Za-z0-9._%+-]{1,64}@gmail\.com$/i;
 
 function log(s) { console.log(new Date().toTimeString().slice(0, 8) + '  ' + s); }
 function load() {
@@ -31,6 +37,28 @@ function load() {
   try { history = JSON.parse(fs.readFileSync(path.join(DATA, 'history.json'), 'utf8')); } catch (e) { history = []; }
   try { dms = JSON.parse(fs.readFileSync(path.join(DATA, 'dms.json'), 'utf8')); } catch (e) { dms = {}; }
   try { dmq = JSON.parse(fs.readFileSync(path.join(DATA, 'dmq.json'), 'utf8')); } catch (e) { dmq = {}; }
+  try { emails = JSON.parse(fs.readFileSync(path.join(DATA, 'emails.json'), 'utf8')); } catch (e) { emails = {}; }
+  try { ips = JSON.parse(fs.readFileSync(path.join(DATA, 'ips.json'), 'utf8')); } catch (e) { ips = {}; }
+}
+
+// Sends an e-mail through a Google Apps Script web app (MAIL_HOOK). Plain HTTPS, so it also works on hosts that block SMTP.
+function sendMail(to, subject, text) {
+  const hook = process.env.MAIL_HOOK;
+  if (!hook) { log('mail not configured (MAIL_HOOK missing) - would have mailed ' + to); return; }
+  try {
+    const u = new URL(hook); const body = JSON.stringify({ secret: process.env.MAIL_SECRET || '', to, subject, body: text });
+    const req = https.request({ method: 'POST', hostname: u.hostname, path: u.pathname + u.search, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Content-Length': Buffer.byteLength(body) } },
+      (res) => { res.resume(); log('mail hook answered ' + res.statusCode); });
+    req.on('error', (e) => log('mail error: ' + e.message)); req.setTimeout(20000, () => req.destroy()); req.write(body); req.end();
+  } catch (e) { log('mail error: ' + e.message); }
+}
+function loginMail(id, name, ip, isNew) {
+  const to = emails[id]; if (!to) return; const t = Date.now();
+  if (lastMail.has(id) && t - lastMail.get(id) < 60000) return; lastMail.set(id, t);
+  const when = new Date().toLocaleString('tr-TR', { timeZone: 'Europe/Istanbul' });
+  const subject = "Poppy's ChatRoom: hesabina giris yapildi (" + (ip || 'bilinmeyen IP') + ')';
+  const text = 'Merhaba ' + (name || id) + ',\n\nPoppy\'s ChatRoom hesabina (' + id + ') az once giris yapildi.\n\nBu IP\'den giris yapildi: ' + (ip || 'bilinmiyor') + '\nZaman: ' + when + ' (Turkiye saati)\n' + (isNew ? '\nBu IP adresi bu hesapta daha once gorulmemisti.\n' : '') + '\nBu sen degilsen sifreni hemen degistir.\n\n---\nSomeone just logged in to your Poppy\'s ChatRoom account (' + id + ') from this IP: ' + (ip || 'unknown') + '. If this was not you, change your password.';
+  sendMail(to, subject, text);
 }
 function saveJson(name, obj) { try { fs.writeFileSync(path.join(DATA, name), JSON.stringify(obj)); } catch (e) {} }
 function saveAvatars() { try { fs.writeFileSync(path.join(DATA, 'avatars.json'), JSON.stringify(avatars)); } catch (e) {} }
@@ -175,7 +203,7 @@ function handleChat(c, p) {
   if (cmd === 'VLEAVE') { leaveVoice(c.id); return true; }
   if (cmd === 'SSTART') { if (voice.has(c.id)) { if (sharer && sharer !== c.id && voice.has(sharer)) send(c, 'ERR', 'busy'); else { sharer = c.id; broadcastShare(); } } return true; }
   if (cmd === 'SSTOP') { if (sharer === c.id) { sharer = ''; broadcastShare(); } return true; }
-  if (cmd === 'SF' && p.length > 1) { if (c.id === sharer && p[1].length < 110000) for (const id of voice.keys()) { if (id !== c.id) { const o = online.get(id); if (o && o.ws.bufferedAmount < 300000) send(o, 'SF', c.id, p[1]); } } return true; }
+  if (cmd === 'SF' && p.length > 1) { if (c.id === sharer && p[1].length < 110000) for (const id of voice.keys()) { if (id !== c.id) { const o = online.get(id); if (o && o.ws.bufferedAmount < 3000000) send(o, 'SF', c.id, p[1]); } } return true; }
   if (cmd === 'VMUTE') { const v = voice.get(c.id); if (v) { v.muted = p[1] === '1'; broadcastVoice(); } return true; }
   if (cmd === 'VA' && p.length > 1) { if (voice.has(c.id) && p[1].length < 6000) for (const id of voice.keys()) { if (id !== c.id) { const o = online.get(id); if (o) send(o, 'VA', c.id, p[1]); } } return true; }
   return false;
@@ -190,7 +218,12 @@ function handle(c, p) {
     if (!users[id]) { users[id] = key; saveUsers(); log('new player ' + id); }
     const old = online.get(id);
     if (old && old !== c) { online.delete(id); try { old.ws.close(); } catch (e) {} }
-    c.id = id; c.name = (p[2] || '').slice(0, 20); online.set(id, c); send(c, 'WELCOME', 'poppy2'); log(id + ' online (' + online.size + ' connected)');
+    c.id = id; c.name = (p[2] || '').slice(0, 20); online.set(id, c); send(c, 'WELCOME', 'poppy3'); log(id + ' online (' + online.size + ' connected)');
+    const flag = p[4] || '0', em = (p[5] || '').trim().toLowerCase();
+    if (mailRx.test(em) && emails[id] !== em) { emails[id] = em; saveJson('emails.json', emails); }
+    const ip = c.ip || ''; const known = (ips[id] = ips[id] || []); const isNew = !!ip && !known.includes(ip);
+    if (isNew) { known.push(ip); if (known.length > 25) known.shift(); saveJson('ips.json', ips); }
+    if (emails[id] && (flag === '1' || (flag === '2' && isNew))) loginMail(id, c.name, ip, isNew);
     const mine = pend.filter(x => x[1] === id);
     for (const x of mine) { send(c, x[0] === 'REQ' ? 'FREQ' : x[0] === 'ACC' ? 'FACC' : x[0] === 'DEC' ? 'FDEC' : 'FREM', x[2]); }
     if (mine.length) { pend = pend.filter(x => x[1] !== id); savePend(); }
@@ -199,6 +232,7 @@ function handle(c, p) {
   }
   if (!c.id) return;
   if (cmd === 'PING') { send(c, 'PONG'); return; }
+  if (cmd === 'EMAIL' && p.length > 1) { const em = p[1].trim().toLowerCase(); if (mailRx.test(em)) { emails[c.id] = em; saveJson('emails.json', emails); } return; }
   if (handleChat(c, p)) return;
   if (cmd === 'FRIENDS') {
     c.watch.clear();
@@ -243,11 +277,12 @@ function drop(c) {
 load();
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end('Poppy server v2 (chat, voice, screen share, games) is running. Players online: ' + online.size + '\n');
+  res.end('Poppy server v3 (chat, voice, screen share, games) is running. Players online: ' + online.size + '. Login e-mails: ' + (process.env.MAIL_HOOK ? 'ON' : 'OFF (set MAIL_HOOK)') + '\n');
 });
 const wss = new WebSocket.Server({ server, maxPayload: 262144 });
-wss.on('connection', (ws) => {
-  const c = { ws, id: '', name: '', watch: new Set() };
+wss.on('connection', (ws, req) => {
+  const c = { ws, id: '', name: '', watch: new Set(), ip: '' };
+  try { c.ip = String((req && req.headers && req.headers['x-forwarded-for']) || '').split(',')[0].trim() || (req && req.socket && req.socket.remoteAddress) || ''; } catch (e) {}
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
   ws.on('message', (data) => {
